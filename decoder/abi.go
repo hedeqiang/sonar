@@ -1,7 +1,6 @@
 package decoder
 
 import (
-	"encoding/binary"
 	"fmt"
 	"math/big"
 	"strings"
@@ -104,6 +103,7 @@ func (d *ABIDecoder) Decode(log event.Log) (*DecodedEvent, error) {
 		Signature: def.Signature,
 		Params:    make(map[string]interface{}),
 		Indexed:   make(map[string]interface{}),
+		Data:      make(map[string]interface{}),
 		Raw:       log,
 	}
 
@@ -137,24 +137,215 @@ func (d *ABIDecoder) Decode(log event.Log) (*DecodedEvent, error) {
 	}
 
 	if len(dataParams) > 0 && len(log.Data) > 0 {
-		offset := 0
-		for i, param := range dataParams {
-			if offset+32 > len(log.Data) {
-				break
-			}
-
-			name := param.Name
-			if name == "" {
-				name = fmt.Sprintf("data%d", i)
-			}
-
-			val := decodeDataValue(param.Type, log.Data[offset:offset+32])
-			decoded.Params[name] = val
-			offset += 32
-		}
+		decodeDataParams(log.Data, dataParams, decoded.Params, decoded.Data)
 	}
 
 	return decoded, nil
+}
+
+// isDynamic returns true if the ABI type is dynamically-sized.
+func isDynamic(typ string) bool {
+	if typ == "string" || typ == "bytes" {
+		return true
+	}
+	// T[] dynamic arrays
+	if strings.HasSuffix(typ, "[]") {
+		return true
+	}
+	// tuple types starting with "(" may be dynamic (simplified: treat all tuples as dynamic)
+	if strings.HasPrefix(typ, "(") {
+		return true
+	}
+	return false
+}
+
+// decodeDataParams decodes all non-indexed parameters from the ABI-encoded data blob.
+// It handles both static (inline) and dynamic (offset-referenced) types.
+// Values are written to both out (all params) and dataOut (data-only params).
+func decodeDataParams(data []byte, params []ParamDef, out, dataOut map[string]interface{}) {
+	// Phase 1: read the head section — 32 bytes per parameter.
+	// For static types, the value is inline.
+	// For dynamic types, the 32 bytes hold an offset (in bytes) into the data blob.
+	for i, param := range params {
+		headOffset := i * 32
+		if headOffset+32 > len(data) {
+			break
+		}
+
+		name := param.Name
+		if name == "" {
+			name = fmt.Sprintf("data%d", i)
+		}
+
+		word := data[headOffset : headOffset+32]
+
+		var val interface{}
+		if isDynamic(param.Type) {
+			// word is a uint256 byte-offset pointing into the data blob
+			dynOffset := new(big.Int).SetBytes(word).Uint64()
+			val = decodeDynamicValue(param.Type, data, dynOffset)
+		} else {
+			val = decodeStaticValue(param.Type, word)
+		}
+		out[name] = val
+		dataOut[name] = val
+	}
+}
+
+// decodeStaticValue decodes a single static (fixed-size) parameter from a 32-byte ABI word.
+func decodeStaticValue(typ string, word []byte) interface{} {
+	switch {
+	case typ == "address":
+		var addr event.Address
+		copy(addr[:], word[12:32])
+		return addr
+
+	case typ == "bool":
+		return word[31] != 0
+
+	case strings.HasPrefix(typ, "uint"):
+		return new(big.Int).SetBytes(word)
+
+	case strings.HasPrefix(typ, "int"):
+		return decodeSigned(word)
+
+	case strings.HasPrefix(typ, "bytes"):
+		// bytesN (fixed-size): return the left-aligned N bytes
+		n := parseBytesN(typ)
+		if n > 0 && n <= 32 {
+			result := make([]byte, n)
+			copy(result, word[:n])
+			return result
+		}
+		return word
+
+	default:
+		return word
+	}
+}
+
+// decodeDynamicValue decodes a dynamic type (string, bytes, T[]) from the data blob
+// starting at the given byte offset.
+func decodeDynamicValue(typ string, data []byte, offset uint64) interface{} {
+	if offset+32 > uint64(len(data)) {
+		return nil
+	}
+
+	switch {
+	case typ == "string":
+		return decodeDynamicBytes(data, offset, true)
+
+	case typ == "bytes":
+		return decodeDynamicBytes(data, offset, false)
+
+	case strings.HasSuffix(typ, "[]"):
+		// Dynamic array: T[]
+		elemType := strings.TrimSuffix(typ, "[]")
+		return decodeDynamicArray(elemType, data, offset)
+
+	default:
+		// Fallback: read as raw bytes
+		return decodeDynamicBytes(data, offset, false)
+	}
+}
+
+// decodeDynamicBytes decodes a bytes/string value at the given offset.
+// Layout: [32-byte length][padded content]
+func decodeDynamicBytes(data []byte, offset uint64, asString bool) interface{} {
+	if offset+32 > uint64(len(data)) {
+		return nil
+	}
+	length := new(big.Int).SetBytes(data[offset : offset+32]).Uint64()
+
+	contentStart := offset + 32
+	if contentStart+length > uint64(len(data)) {
+		// Truncated — return what we have
+		length = uint64(len(data)) - contentStart
+	}
+
+	content := make([]byte, length)
+	copy(content, data[contentStart:contentStart+length])
+
+	if asString {
+		return string(content)
+	}
+	return content
+}
+
+// decodeDynamicArray decodes a dynamic array T[] at the given offset.
+// Layout: [32-byte count][element0][element1]...
+func decodeDynamicArray(elemType string, data []byte, offset uint64) interface{} {
+	if offset+32 > uint64(len(data)) {
+		return nil
+	}
+
+	count := new(big.Int).SetBytes(data[offset : offset+32]).Uint64()
+	if count == 0 {
+		return []interface{}{}
+	}
+
+	result := make([]interface{}, 0, count)
+	elemOffset := offset + 32
+
+	if isDynamic(elemType) {
+		// Each element in the head is an offset relative to the array's data section
+		for i := uint64(0); i < count; i++ {
+			headPos := elemOffset + i*32
+			if headPos+32 > uint64(len(data)) {
+				break
+			}
+			relOffset := new(big.Int).SetBytes(data[headPos : headPos+32]).Uint64()
+			val := decodeDynamicValue(elemType, data, elemOffset+relOffset)
+			result = append(result, val)
+		}
+	} else {
+		// Static elements are packed sequentially
+		for i := uint64(0); i < count; i++ {
+			pos := elemOffset + i*32
+			if pos+32 > uint64(len(data)) {
+				break
+			}
+			val := decodeStaticValue(elemType, data[pos:pos+32])
+			result = append(result, val)
+		}
+	}
+
+	return result
+}
+
+// decodeSigned interprets a 32-byte big-endian word as a signed two's complement integer.
+func decodeSigned(word []byte) *big.Int {
+	val := new(big.Int).SetBytes(word)
+	// If the high bit is set, it's negative
+	if word[0]&0x80 != 0 {
+		// two's complement: val - 2^256
+		max := new(big.Int).Lsh(big.NewInt(1), 256)
+		val.Sub(val, max)
+	}
+	return val
+}
+
+// parseBytesN extracts N from "bytesN" (e.g., "bytes32" → 32, "bytes4" → 4).
+// Returns 0 if the type is not a valid fixed bytesN.
+func parseBytesN(typ string) int {
+	if !strings.HasPrefix(typ, "bytes") {
+		return 0
+	}
+	suffix := typ[5:]
+	if suffix == "" {
+		return 0 // "bytes" without a number is dynamic
+	}
+	n := 0
+	for _, c := range suffix {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n < 1 || n > 32 {
+		return 0
+	}
+	return n
 }
 
 // decodeTopicValue decodes a single indexed parameter from a 32-byte topic.
@@ -169,34 +360,17 @@ func decodeTopicValue(typ string, topic event.Hash) interface{} {
 	case strings.HasPrefix(typ, "uint"):
 		return new(big.Int).SetBytes(topic[:])
 	case strings.HasPrefix(typ, "int"):
-		return new(big.Int).SetBytes(topic[:])
+		return decodeSigned(topic[:])
 	case strings.HasPrefix(typ, "bytes"):
-		return topic
-	default:
-		return topic
-	}
-}
-
-// decodeDataValue decodes a single non-indexed parameter from a 32-byte ABI word.
-func decodeDataValue(typ string, data []byte) interface{} {
-	switch {
-	case typ == "address":
-		var addr event.Address
-		copy(addr[:], data[12:32])
-		return addr
-	case typ == "bool":
-		return data[31] != 0
-	case strings.HasPrefix(typ, "uint"):
-		return new(big.Int).SetBytes(data)
-	case strings.HasPrefix(typ, "int"):
-		return new(big.Int).SetBytes(data)
-	case typ == "string" || typ == "bytes":
-		return data
-	default:
-		// For fixed-size bytesN types
-		if len(data) >= 8 {
-			return binary.BigEndian.Uint64(data[24:32])
+		n := parseBytesN(typ)
+		if n > 0 && n <= 32 {
+			result := make([]byte, n)
+			copy(result, topic[:n])
+			return result
 		}
-		return data
+		// dynamic bytes/string as indexed → topic is keccak256 hash
+		return topic
+	default:
+		return topic
 	}
 }

@@ -312,6 +312,62 @@ s.Watch("ethereum", query, func(log event.Log) {
 })
 ```
 
+### DecodedEvent Output
+
+`DecodedEvent` provides three ways to consume decoded data:
+
+**String() — human-readable output:**
+
+```go
+fmt.Println(ev.String())
+// Transfer(from=0xAb5801a7..., to=0x4E83362e..., value=1000000) chain=ethereum block=21000000 tx=0xabc...
+```
+
+**JSON() / MarshalJSON() — JSON serialization:**
+
+```go
+jsonBytes, _ := json.MarshalIndent(ev, "", "  ")
+fmt.Println(string(jsonBytes))
+```
+
+```json
+{
+  "event": "Transfer",
+  "signature": "Transfer(address,address,uint256)",
+  "chain": "ethereum",
+  "blockNumber": 21000000,
+  "txHash": "0xabc...",
+  "address": "0xdac17f...",
+  "params":  { "from": "0xAb5801a7...", "to": "0x4E83362e...", "value": "1000000" },
+  "indexed": { "from": "0xAb5801a7...", "to": "0x4E83362e..." },
+  "data":    { "value": "1000000" }
+}
+```
+
+- `params` — all parameters (indexed + non-indexed)
+- `indexed` — indexed parameters only (from topics)
+- `data` — non-indexed parameters only (from log data)
+
+Address/Hash are hex-encoded, `*big.Int` becomes a decimal string, `[]byte` becomes `0x`-prefixed hex.
+
+**Bind() — decode into a custom struct:**
+
+```go
+type TransferEvent struct {
+    From  event.Address `abi:"from"`
+    To    event.Address `abi:"to"`
+    Value *big.Int      `abi:"value"`
+}
+
+var evt TransferEvent
+if err := ev.Bind(&evt); err != nil {
+    log.Fatal(err)
+}
+fmt.Printf("%s -> %s : %s\n", evt.From.Hex(), evt.To.Hex(), evt.Value.String())
+```
+
+Fields are matched by the `abi` struct tag, or by field name (case-insensitive). Supported types: `event.Address`, `event.Hash`, `*big.Int`, `bool`, `string`, `uint64`, `int64`, `[]byte`.
+
 ### Filtering
 
 ```go

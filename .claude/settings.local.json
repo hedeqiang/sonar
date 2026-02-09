@@ -6,7 +6,11 @@
       "Bash(go build:*)",
       "Bash(go vet:*)",
       "Bash(go run:*)",
-      "Bash(go mod tidy:*)"
+      "Bash(go mod tidy:*)",
+      "Bash(SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com go run:*)",
+      "Bash(ETH_RPC_URL=https://ethereum-rpc.publicnode.com go run:*)",
+      "Bash(git -C /Users/hedeqiang/Workspace/Go/sonar status)",
+      "Bash(git -C /Users/hedeqiang/Workspace/Go/sonar diff)"
     ]
   }
 }

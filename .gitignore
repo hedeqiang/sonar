@@ -4,6 +4,12 @@
 *.dll
 *.so
 *.dylib
+/basic
+/decoded
+/replay
+/multichain
+/jsonabi
+/voting
 
 # Test binary
 *.test
@@ -25,10 +31,10 @@ vendor/
 *.swo
 *~
 
-# OS
+# Claude
+.claude/
 .DS_Store
 Thumbs.db
 
 # Sonar progress files
-sonar_progress.json
-progress.json
+progress*.json
